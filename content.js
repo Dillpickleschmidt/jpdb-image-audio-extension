@@ -285,14 +285,6 @@ async function getImmersionKitData(vocab, exactSearch) {
   let attempt = 0;
 
   const storedValue = await chromeStorage.get(state.vocab);
-  const isBlacklisted =
-    storedValue &&
-    storedValue.split(",").length > 1 &&
-    parseInt(storedValue.split(",")[1], 10) === 2;
-
-  if (isBlacklisted) {
-    return;
-  }
 
   async function fetchData() {
     try {
@@ -413,17 +405,29 @@ function validateApiResponse(jsonData) {
 async function getStoredData(key) {
   const storedValue = await chromeStorage.get(key);
   if (storedValue) {
-    const [sentence, occurrenceIndex] = storedValue.split(",");
+    const [image_url, sound_url, sentence] = storedValue.split(",");
     return {
+      image_url,
+      sound_url,
       sentence,
-      occurrenceIndex: parseInt(occurrenceIndex, 10),
     };
   }
+
+  // Check defaults if no user favorite exists
+  if (DEFAULT_FAVORITES[key]) {
+    const [image_url, sound_url, sentence] = DEFAULT_FAVORITES[key];
+    return {
+      image_url,
+      sound_url,
+      sentence,
+    };
+  }
+
   return null;
 }
 
-async function storeData(key, sentence, occurrenceIndex) {
-  const value = `${sentence},${occurrenceIndex}`;
+async function storeData(key, image_url, sound_url, sentence) {
+  const value = `${image_url},${sound_url},${sentence}`;
   await chromeStorage.set(key, value);
 }
 
@@ -569,9 +573,9 @@ async function createStarButton() {
   const currentExample = state.examples[state.currentExampleIndex];
 
   if (storedValue && currentExample) {
-    const [storedSentence] = storedValue.split(",");
+    const [storedImageUrl] = storedValue.split(",");
     starIcon.textContent =
-      currentExample.sentence === storedSentence ? "★" : "☆";
+      currentExample.image_url === storedImageUrl ? "★" : "☆";
   } else {
     starIcon.textContent = "☆";
   }
@@ -593,32 +597,26 @@ async function createStarButton() {
 
 async function toggleStarState(starIcon) {
   const storedValue = await chromeStorage.get(state.vocab);
-  const isBlacklisted =
-    storedValue &&
-    storedValue.split(",").length > 1 &&
-    storedValue.split(",")[1] === "2";
-
-  if (isBlacklisted) {
-    starIcon.textContent = "☆";
-    return;
-  }
 
   const currentExample = state.examples[state.currentExampleIndex];
-  if (!currentExample || !currentExample.sentence) {
+  if (
+    !currentExample ||
+    !currentExample.image_url ||
+    !currentExample.sound_url
+  ) {
     return;
   }
 
   if (storedValue) {
-    const [storedSentence] = storedValue.split(",");
-    if (storedSentence === currentExample.sentence) {
-      await chromeStorage.remove(state.vocab);
-      starIcon.textContent = "☆";
-    } else {
-      await storeData(state.vocab, currentExample.sentence, 0); // Start with first occurrence
-      starIcon.textContent = "★";
-    }
+    await chromeStorage.remove(state.vocab);
+    starIcon.textContent = "☆";
   } else {
-    await storeData(state.vocab, currentExample.sentence, 0);
+    await storeData(
+      state.vocab,
+      currentExample.image_url,
+      currentExample.sound_url,
+      currentExample.sentence
+    );
     starIcon.textContent = "★";
   }
 }
@@ -1149,10 +1147,6 @@ async function renderImageAndPlayAudio(vocab, shouldAutoPlaySound) {
   const translation = example.translation || null;
   const deck_name = example.deck_name || null;
   const storedValue = await chromeStorage.get(state.vocab);
-  const isBlacklisted =
-    storedValue &&
-    storedValue.split(",").length > 1 &&
-    parseInt(storedValue.split(",")[1], 10) === 2;
 
   removeExistingContainer();
   if (!shouldRenderContainer()) return;
@@ -1173,10 +1167,7 @@ async function renderImageAndPlayAudio(vocab, shouldAutoPlaySound) {
     return textElement;
   };
 
-  if (isBlacklisted) {
-    wrapperDiv.appendChild(createTextElement("BLACKLISTED"));
-    shouldAutoPlaySound = false;
-  } else if (state.apiDataFetched) {
+  if (state.apiDataFetched) {
     if (imageUrl) {
       const imageElement = createImageElement(
         wrapperDiv,
@@ -1568,50 +1559,48 @@ async function onPageLoad() {
   }
 
   const storedData = await getStoredData(state.vocab);
-  let favoriteExample = null;
 
   if (storedData) {
-    // Try to find the exact favorited example
-    favoriteExample = await findExampleBySentence(
-      storedData.sentence,
-      storedData.occurrenceIndex
-    );
-  }
+    // Create a favorite example object with just the essential properties
+    const favoriteExample = {
+      image_url: storedData.image_url,
+      sound_url: storedData.sound_url,
+      sentence: storedData.sentence,
+    };
 
-  // Always do the normal search with user preferences
-  if (state.vocab && !state.apiDataFetched) {
     try {
       await getImmersionKitData(state.vocab, state.exactSearch);
-
-      // If we found a favorite, add it to the beginning and remove any duplicates
-      if (favoriteExample) {
-        state.examples = [
-          favoriteExample,
-          ...state.examples.filter(
-            (ex) => ex.sentence !== favoriteExample.sentence
-          ),
-        ];
-        state.currentExampleIndex = 0;
-      }
-
+      state.examples = [
+        favoriteExample,
+        ...state.examples.filter(
+          (ex) => ex.image_url !== favoriteExample.image_url
+        ),
+      ];
+      state.currentExampleIndex = 0;
       preloadImages();
       if (!/https:\/\/jpdb\.io\/review(#a)?$/.test(url)) {
         embedImageAndPlayAudio();
       }
     } catch (error) {
       console.error(error);
-      // If normal search fails but we have a favorite, at least show that
-      if (favoriteExample) {
-        state.examples = [favoriteExample];
-        state.currentExampleIndex = 0;
-        state.apiDataFetched = true;
-        embedImageAndPlayAudio();
+      state.examples = [favoriteExample];
+      state.currentExampleIndex = 0;
+      state.apiDataFetched = true;
+      embedImageAndPlayAudio();
+    }
+  } else {
+    // No favorite exists, proceed with normal search
+    if (state.vocab && !state.apiDataFetched) {
+      try {
+        await getImmersionKitData(state.vocab, state.exactSearch);
+        preloadImages();
+        if (!/https:\/\/jpdb\.io\/review(#a)?$/.test(url)) {
+          embedImageAndPlayAudio();
+        }
+      } catch (error) {
+        console.error(error);
       }
     }
-  } else if (state.apiDataFetched) {
-    embedImageAndPlayAudio();
-    setVocabSize();
-    setPageWidth();
   }
 }
 
