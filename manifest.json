@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "JPDB Immersion Kit Examples",
+  "version": "1.20",
+  "description": "Embeds anime images & audio examples into JPDB review and vocabulary pages using Immersion Kit's API",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://jpdb.io/*",
+    "https://immersionkit.com/*",
+    "https://linodeobjects.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://jpdb.io/review*",
+        "https://jpdb.io/vocabulary/*",
+        "https://jpdb.io/kanji/*",
+        "https://jpdb.io/search*"
+      ],
+      "js": ["defaults.js", "content.js"]
+    }
+  ]
+}
