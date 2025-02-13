@@ -19,5 +19,11 @@
       ],
       "js": ["defaults.js", "content.js"]
     }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["sorted-vocab.csv"],
+      "matches": ["https://jpdb.io/*"]
+    }
   ]
 }

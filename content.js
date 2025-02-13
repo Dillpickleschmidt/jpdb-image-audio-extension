@@ -31,6 +31,7 @@ const state = {
   exactSearch: false,
   error: false,
   currentlyPlayingAudio: false,
+  vocabContent: null,
 };
 
 // Chrome Storage Wrapper
@@ -82,6 +83,8 @@ function addElement(parent, tag, attributes) {
   parent.appendChild(element);
   return element;
 }
+
+//#endregion
 
 // #region IndexedDB Manager Implementation
 /*
@@ -276,6 +279,134 @@ const IndexedDBManager = {
 //#endregion
 
 // #region API Functions
+
+// Vocabulary sorting constants and utilities
+// It uses sorted-vocab.csv (a list of Genki words) to sort the examples.
+// If the current word is found in that list, it will try to find examples
+// with vocabulary at similar lesson levels or below.
+const SORT_WEIGHTS = {
+  length: 0.3, // Moderate emphasis on sentence length
+  vocab: 0.5, // Stronger emphasis on known vocabulary
+  proximity: 0.2, // Moderate emphasis on words from same lesson
+};
+// The weights are conservative because the segmentation from the API is
+// kind of inaccurate, especially for verbs.
+
+const OPTIMAL_LENGTH = 30; // Target sentence length
+
+// Process vocabulary list from CSV content
+function processVocabList(content) {
+  if (!content) {
+    return {
+      entries: [],
+      kanjiMap: new Map(),
+      kanaMap: new Map(),
+    };
+  }
+
+  const entries = [];
+  const kanjiMap = new Map();
+  const kanaMap = new Map();
+
+  content.split("\n").forEach((line) => {
+    const parts = line.split(",");
+    if (parts.length >= 6) {
+      const [, kana, kanji, , , lesson] = parts.map((p) => p.trim());
+      if (kana && lesson) {
+        const lessonNum = getLessonNumber(lesson);
+        const entry = {
+          kana,
+          kanji: kanji || null,
+          lesson: lessonNum,
+        };
+        entries.push(entry);
+
+        if (kanji) {
+          kanjiMap.set(kanji, lessonNum);
+        }
+        kanaMap.set(kana, lessonNum);
+      }
+    }
+  });
+
+  return { entries, kanjiMap, kanaMap };
+}
+
+function getLessonNumber(lesson) {
+  if (lesson === "会G") return 0;
+  const match = lesson.match(/L(\d+)/);
+  return match ? parseInt(match[1]) : Infinity;
+}
+
+function calculateSentenceScore(
+  sentence,
+  wordList,
+  kanjiMap,
+  kanaMap,
+  targetWord,
+  targetLesson
+) {
+  if (wordList.length === 0) return 0;
+
+  const otherWords = wordList.filter((word) => word !== targetWord);
+  if (otherWords.length === 0) return 0;
+
+  let knownWords = 0;
+  let proximitySum = 0;
+  let proximityCounts = 0;
+
+  otherWords.forEach((word) => {
+    const lessonNum = kanjiMap.get(word) ?? kanaMap.get(word) ?? Infinity;
+    if (lessonNum <= targetLesson) {
+      knownWords++;
+      const lessonDiff = targetLesson - lessonNum;
+      const proximityScore = Math.exp(-lessonDiff / 2);
+      proximitySum += proximityScore;
+      proximityCounts++;
+    }
+  });
+
+  const vocabScore = 1 - Math.exp(-knownWords / 5);
+  const proximityScore =
+    proximityCounts > 0 ? proximitySum / proximityCounts : 0;
+
+  let lengthScore;
+  if (sentence.length <= OPTIMAL_LENGTH) {
+    lengthScore = 1.0;
+  } else {
+    const excess = sentence.length - OPTIMAL_LENGTH;
+    lengthScore = Math.exp(-excess / 20);
+  }
+
+  return (
+    vocabScore * SORT_WEIGHTS.vocab +
+    lengthScore * SORT_WEIGHTS.length +
+    proximityScore * SORT_WEIGHTS.proximity
+  );
+}
+
+function rankExamples(examples, targetWord, vocabData) {
+  const { kanjiMap, kanaMap } = vocabData;
+  const targetLesson = kanjiMap.get(targetWord) ?? kanaMap.get(targetWord);
+
+  if (targetLesson === undefined) return examples;
+
+  const scoredExamples = examples.map((example) => ({
+    example,
+    score: calculateSentenceScore(
+      example.sentence,
+      example.word_list,
+      kanjiMap,
+      kanaMap,
+      targetWord,
+      targetLesson
+    ),
+  }));
+
+  scoredExamples.sort((a, b) => b.score - a.score);
+  return scoredExamples.map(({ example }) => example);
+}
+
 async function getImmersionKitData(vocab, exactSearch) {
   const searchVocab = exactSearch ? `「${vocab}」` : vocab;
   const url = `https://api.immersionkit.com/look_up_dictionary?keyword=${encodeURIComponent(
@@ -284,44 +415,53 @@ async function getImmersionKitData(vocab, exactSearch) {
   const maxRetries = 5;
   let attempt = 0;
 
-  const storedValue = await chromeStorage.get(state.vocab);
-
   async function fetchData() {
     try {
       const db = await IndexedDBManager.open();
       const cachedData = await IndexedDBManager.get(db, searchVocab);
+
       if (
         cachedData &&
         Array.isArray(cachedData.data) &&
         cachedData.data.length > 0
       ) {
-        console.log("Data retrieved from IndexedDB");
+        // Just use the cached examples directly without ranking since they were already ranked
         state.examples = cachedData.data[0].examples;
         state.apiDataFetched = true;
         return;
       }
 
-      console.log(`Calling API for: ${searchVocab}`);
       try {
         const response = await fetch(url);
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }
         const jsonData = await response.json();
-        console.log("API JSON Received");
-        console.log(url);
 
         const validationError = validateApiResponse(jsonData);
         if (!validationError) {
-          state.examples = jsonData.data[0].examples;
+          // Rank the examples before saving to cache
+          const vocabData = processVocabList(state.vocabContent);
+          state.examples = rankExamples(
+            jsonData.data[0].examples,
+            vocab,
+            vocabData
+          );
           state.apiDataFetched = true;
-          await IndexedDBManager.save(db, searchVocab, jsonData);
+
+          // Create a slim version with the ranked examples for saving
+          const slimData = {
+            data: [
+              {
+                category_count: jsonData.data[0].category_count,
+                examples: state.examples,
+              },
+            ],
+          };
+          await IndexedDBManager.save(db, searchVocab, slimData);
         } else {
           attempt++;
           if (attempt < maxRetries) {
-            console.log(
-              `Validation error: ${validationError}. Retrying... (${attempt}/${maxRetries})`
-            );
             await new Promise((resolve) => setTimeout(resolve, 2000));
             return fetchData();
           } else {
@@ -995,34 +1135,37 @@ async function saveConfig() {
   const overlay = document.getElementById("overlayMenu");
   if (!overlay) return;
 
-  const inputs = overlay.querySelectorAll("input[data-key], span[data-key]");
   const changes = {};
+  const inputs = overlay.querySelectorAll("input[data-key], span[data-key]");
 
-  inputs.forEach((input) => {
+  for (const input of inputs) {
     const key = input.getAttribute("data-key");
     const type = input.getAttribute("data-type");
-    let value;
 
+    if (!key || !type || !CONFIG.hasOwnProperty(key)) continue;
+
+    let value;
     if (type === "boolean") {
       value = input.checked;
     } else if (type === "number") {
       value = parseFloat(input.textContent);
     } else if (type === "string") {
-      value = input.textContent + input.getAttribute("data-type-part");
+      value = input.textContent + (input.getAttribute("data-type-part") || "");
     }
 
-    if (key && type) {
+    // Only save if value is valid and different from current
+    if (value !== undefined && value !== CONFIG[key]) {
       changes[`CONFIG.${key}`] = value;
+      CONFIG[key] = value; // Update current config immediately
     }
-  });
-
-  // Save changes to chrome.storage
-  for (const [key, value] of Object.entries(changes)) {
-    await chromeStorage.set(key, value);
   }
 
-  // Update current config
-  await loadConfig();
+  // Save changes to chrome.storage
+  if (Object.keys(changes).length > 0) {
+    for (const [key, value] of Object.entries(changes)) {
+      await chromeStorage.set(key, value);
+    }
+  }
 
   // Refresh display
   renderImageAndPlayAudio(state.vocab, CONFIG.AUTO_PLAY_SOUND);
@@ -1036,35 +1179,44 @@ async function saveConfig() {
 
 // #region Audio Functions
 function stopCurrentAudio() {
-  if (state.currentAudio) {
+  if (!state.currentAudio) return;
+
+  try {
     state.currentAudio.source.stop();
     state.currentAudio.context.close();
-    state.currentAudio = null;
+  } catch (error) {
+    console.error("Error stopping audio:", error);
   }
+
+  state.currentAudio = null;
+  state.currentlyPlayingAudio = false;
 }
 
 async function playAudio(soundUrl) {
-  if (state.currentlyPlayingAudio || !soundUrl) {
-    return;
-  }
-
-  state.currentlyPlayingAudio = true;
+  if (!soundUrl) return;
   stopCurrentAudio();
+  await new Promise((resolve) => setTimeout(resolve, 50));
 
   try {
+    state.currentlyPlayingAudio = true;
     const response = await fetch(soundUrl);
-    const arrayBuffer = await response.arrayBuffer();
     const audioContext = new (window.AudioContext ||
       window.webkitAudioContext)();
+    const audioBuffer = await audioContext.decodeAudioData(
+      await response.arrayBuffer()
+    );
 
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    if (state.currentlyPlayingAudio && state.currentAudio) {
+      audioContext.close();
+      return;
+    }
+
     const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-
     const gainNode = audioContext.createGain();
+
+    source.buffer = audioBuffer;
     source.connect(gainNode);
     gainNode.connect(audioContext.destination);
-
     gainNode.gain.setValueAtTime(0, audioContext.currentTime);
     gainNode.gain.linearRampToValueAtTime(
       CONFIG.SOUND_VOLUME / 100,
@@ -1072,18 +1224,18 @@ async function playAudio(soundUrl) {
     );
 
     source.start(0, 0.05);
+    state.currentAudio = { context: audioContext, source };
 
-    state.currentAudio = {
-      context: audioContext,
-      source: source,
-    };
-
-    source.onended = function () {
+    source.onended = source.onerror = () => {
       state.currentlyPlayingAudio = false;
+      state.currentAudio?.context.close();
+      state.currentAudio = null;
     };
   } catch (error) {
     console.error("Error playing audio:", error);
     state.currentlyPlayingAudio = false;
+    state.currentAudio?.context.close();
+    state.currentAudio = null;
   }
 }
 // #endregion
@@ -1234,21 +1386,11 @@ function preloadImages() {
 function highlightVocab(sentence, vocab) {
   if (!CONFIG.COLORED_SENTENCE_TEXT) return sentence;
 
-  if (state.exactSearch) {
-    const regex = new RegExp(`(${vocab})`, "g");
-    return sentence.replace(
-      regex,
-      '<span style="color: var(--outline-input-color);">$1</span>'
-    );
-  } else {
-    return vocab.split("").reduce((acc, char) => {
-      const regex = new RegExp(char, "g");
-      return acc.replace(
-        regex,
-        `<span style="color: var(--outline-input-color);">${char}</span>`
-      );
-    }, sentence);
-  }
+  const regex = new RegExp(`(${vocab})`, "g");
+  return sentence.replace(
+    regex,
+    '<span style="color: var(--outline-input-color);">$1</span>'
+  );
 }
 
 function appendSentenceAndTranslation(wrapperDiv, sentence, translation) {
@@ -1641,15 +1783,19 @@ async function loadConfig() {
     if (!CONFIG.hasOwnProperty(configKey)) continue;
 
     const savedValue = configs[key];
-    if (savedValue === null) continue;
+    if (savedValue === null || savedValue === undefined) continue;
 
-    const valueType = typeof CONFIG[configKey];
-    if (valueType === "boolean") {
-      CONFIG[configKey] = savedValue === "true";
-    } else if (valueType === "number") {
-      CONFIG[configKey] = parseFloat(savedValue);
-    } else if (valueType === "string") {
-      CONFIG[configKey] = savedValue;
+    // Handle different types appropriately
+    switch (typeof CONFIG[configKey]) {
+      case "boolean":
+        CONFIG[configKey] = savedValue === true || savedValue === "true";
+        break;
+      case "number":
+        CONFIG[configKey] = Number(savedValue);
+        break;
+      case "string":
+        CONFIG[configKey] = String(savedValue);
+        break;
     }
   }
 }
@@ -1662,9 +1808,30 @@ const observer = new MutationObserver(() => {
   }
 });
 
+async function loadVocabContent() {
+  try {
+    // Get the URL for the CSV file
+    const url = chrome.runtime.getURL("sorted-vocab.csv");
+    console.log("Attempting to load vocab from:", url);
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to load vocab file: ${response.status}`);
+    }
+
+    const text = await response.text();
+    console.log("Successfully loaded vocab file, length:", text.length);
+    state.vocabContent = text;
+  } catch (error) {
+    console.error("Error loading vocab content:", error);
+    state.vocabContent = null;
+  }
+}
+
 // Initialize Extension
 async function initializeExtension() {
   await loadConfig();
+  await loadVocabContent();
   setPageWidth();
   setVocabSize();
 
