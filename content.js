@@ -1674,30 +1674,32 @@ async function onPageLoad() {
   state.embedAboveSubsectionMeanings = false;
 
   const url = window.location.href;
+  const isSearchPage = url.includes("/search?q=");
   const machineTranslationFrame = document.getElementById(
     "machine-translation-frame"
   );
 
-  if (!machineTranslationFrame) {
-    embedImageAndPlayAudio();
-    setPageWidth();
-
-    if (url.includes("/vocabulary/")) {
-      state.vocab = parseVocabFromVocabulary();
-    } else if (url.includes("/search?q=")) {
-      state.vocab = parseVocabFromSearch();
-    } else if (url.includes("c=")) {
-      state.vocab = parseVocabFromAnswer();
-    } else if (url.includes("/kanji/")) {
-      state.vocab = parseVocabFromKanji();
-    } else {
-      state.vocab = parseVocabFromReview();
-    }
-  } else {
+  // Only check for machine translation frame if we're not on a search page
+  if (!isSearchPage && machineTranslationFrame) {
     console.log(
       "Machine translation frame detected, skipping vocabulary parsing."
     );
     return;
+  }
+
+  embedImageAndPlayAudio();
+  setPageWidth();
+
+  if (url.includes("/vocabulary/")) {
+    state.vocab = parseVocabFromVocabulary();
+  } else if (isSearchPage) {
+    state.vocab = parseVocabFromSearch();
+  } else if (url.includes("c=")) {
+    state.vocab = parseVocabFromAnswer();
+  } else if (url.includes("/kanji/")) {
+    state.vocab = parseVocabFromKanji();
+  } else {
+    state.vocab = parseVocabFromReview();
   }
 
   const storedData = await getStoredData(state.vocab);
